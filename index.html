@@ -211,16 +211,16 @@ function captureArea() {
       let found = false;
       outer:
       for (let rad = 1; rad <= 6; rad++) {
+        // Iterate only the perimeter cells of this radius square
         for (let dc = -rad; dc <= rad; dc++) {
-          for (let dr = -rad; dr <= rad; dr++) {
-            if (Math.abs(dc) === rad || Math.abs(dr) === rad) {
-              if (getCell(qc + dc, qr + dr) === FREE) {
-                qc += dc; qr += dr;
-                found = true;
-                break outer;
-              }
-            }
-          }
+          // Top and bottom rows of this radius
+          if (getCell(qc + dc, qr - rad) === FREE) { qc += dc; qr -= rad; found = true; break outer; }
+          if (getCell(qc + dc, qr + rad) === FREE) { qc += dc; qr += rad; found = true; break outer; }
+        }
+        for (let dr = -rad + 1; dr <= rad - 1; dr++) {
+          // Left and right columns (excluding already-checked corners)
+          if (getCell(qc - rad, qr + dr) === FREE) { qc -= rad; qr += dr; found = true; break outer; }
+          if (getCell(qc + rad, qr + dr) === FREE) { qc += rad; qr += dr; found = true; break outer; }
         }
       }
       if (!found) continue;
@@ -598,7 +598,7 @@ function drawQix(q) {
     const angle = q.armAngle + (i / numArms) * Math.PI * 2;
     const ax    = Math.cos(angle) * armLen;
     const ay    = Math.sin(angle) * armLen;
-    const hue   = Math.round(((i / numArms) * 60)) ; // red–orange range
+    const hue   = Math.round((i / numArms) * 60); // red–orange range
 
     ctx.strokeStyle = `hsl(${hue}, 90%, 60%)`;
     ctx.lineWidth   = 2.5;
@@ -780,7 +780,7 @@ function drawGameOver() {
                CH / 2 + 8, '22px "Courier New"', '#ffffff', null);
   centeredText(`Level Reached: ${level}`,
                CH / 2 + 40, '18px "Courier New"', '#b0bec5', null);
-  centeredText('Press ENTER to play again',
+  centeredText('Press ENTER or SPACE to play again',
                CH / 2 + 82, '17px "Courier New"', '#ffd54f', '#ffd54f');
 }
 

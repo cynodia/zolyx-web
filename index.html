@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zolyx</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: 'Courier New', monospace;
+      color: #fff;
+    }
+    canvas { display: block; image-rendering: pixelated; }
+    #instructions {
+      margin-top: 10px;
+      color: #546e7a;
+      font-size: 13px;
+      text-align: center;
+      line-height: 1.6;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div id="instructions">
+    Arrow keys / WASD to move &nbsp;|&nbsp; Move off the border to start drawing
+    &nbsp;|&nbsp; Return to border to capture area &nbsp;|&nbsp; ENTER to restart
+  </div>
+
+<script>
+'use strict';
+(function () {
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+const CELL  = 10;          // pixels per grid cell
+const COLS  = 76;          // grid columns
+const ROWS  = 56;          // grid rows
+const GX    = 20;          // grid pixel offset x
+const GY    = 52;          // grid pixel offset y  (HUD lives above)
+const CW    = GX * 2 + COLS * CELL;       // canvas width  = 800
+const CH    = GY + ROWS * CELL + 30;      // canvas height = 642
+
+// Cell type constants
+const FREE     = 0;
+const BORDER   = 1;
+const TRAIL    = 2;
+const CAPTURED = 3;
+
+// All capturable (inner) cells
+const TOTAL_INNER = (COLS - 2) * (ROWS - 2);   // 74 × 54 = 3996
+
+// Player movement speed (cells per second)
+const PLAYER_SPEED = 10;
+
+// Directions: column-delta and row-delta
+const DC = { l: -1, r: 1, u: 0, d: 0 };
+const DR = { l:  0, r: 0, u: -1, d: 1 };
+
+// ─── CANVAS ───────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('game');
+canvas.width  = CW;
+canvas.height = CH;
+const ctx = canvas.getContext('2d');
+
+// ─── GRID ─────────────────────────────────────────────────────────────────────
+let grid = new Uint8Array(COLS * ROWS);
+
+function getCell(c, r) {
+  if (c < 0 || c >= COLS || r < 0 || r >= ROWS) return -1;
+  return grid[r * COLS + c];
+}
+
+function setCell(c, r, v) {
+  if (c >= 0 && c < COLS && r >= 0 && r < ROWS)
+    grid[r * COLS + c] = v;
+}
+
+function initGrid() {
+  grid.fill(FREE);
+  for (let c = 0; c < COLS; c++) {
+    setCell(c, 0,      BORDER);
+    setCell(c, ROWS-1, BORDER);
+  }
+  for (let r = 1; r < ROWS-1; r++) {
+    setCell(0,      r, BORDER);
+    setCell(COLS-1, r, BORDER);
+  }
+}
+
+function countCaptured() {
+  let n = 0;
+  for (let i = 0; i < grid.length; i++) if (grid[i] === CAPTURED) n++;
+  return n;
+}
+
+// ─── GAME STATE ───────────────────────────────────────────────────────────────
+let level, lives, score, captureThreshold;
+// 'playing' | 'dead' | 'levelclear' | 'gameover' | 'intro'
+let gameState = 'intro';
+let stateTimer = 0;
+
+// ─── PLAYER ───────────────────────────────────────────────────────────────────
+let player;
+
+function initPlayer() {
+  const startC = Math.floor(COLS / 2);
+  player = {
+    c:        startC,   // current grid col (integer)
+    r:        0,        // current grid row (integer)
+    pc:       startC,   // previous col (for interpolation)
+    pr:       0,        // previous row
+    progress: 1.0,      // 0 = at prev, 1 = at current
+    dir:      null,     // direction currently moving ('l','r','u','d')
+    state:    'EDGE',   // 'EDGE' | 'DRAW'
+    trail:    [],       // [[col,row], ...] cells in current draw stroke
+    invTimer: 0,        // seconds of post-death invincibility
+  };
+}
+
+// Interpolated display position in grid-cell units (float)
+function playerPos() {
+  const t = player.progress;
+  return {
+    x: player.pc + (player.c - player.pc) * t,
+    y: player.pr + (player.r - player.pr) * t,
+  };
+}
+
+// ─── BORDER PATH ──────────────────────────────────────────────────────────────
+// Ordered array of [col, row] cells going clockwise around outer border.
+// Used by Sparx to traverse the perimeter.
+let borderPath = [];
+
+function buildBorderPath() {
+  borderPath = [];
+  for (let c = 0; c < COLS; c++)       borderPath.push([c, 0]);
+  for (let r = 1; r < ROWS; r++)       borderPath.push([COLS-1, r]);
+  for (let c = COLS-2; c >= 0; c--)    borderPath.push([c, ROWS-1]);
+  for (let r = ROWS-2; r >= 1; r--)    borderPath.push([0, r]);
+}
+
+// ─── SPARX ────────────────────────────────────────────────────────────────────
+let sparxList = [];
+
+function initSparx(count, speedScale) {
+  sparxList = [];
+  const blen = borderPath.length;
+  for (let i = 0; i < count; i++) {
+    sparxList.push({
+      pos:   (i * blen / count),                              // fractional path index
+      dir:   i % 2 === 0 ? 1 : -1,                           // cw / ccw
+      speed: (22 + speedScale * 5) * (0.85 + Math.random() * 0.3),
+    });
+  }
+}
+
+// Returns the interpolated {x, y} in grid-cell units for a Sparx
+function sparxPos(sp) {
+  const blen = borderPath.length;
+  const pos  = ((sp.pos % blen) + blen) % blen;
+  const idx  = Math.floor(pos);
+  const frac = pos - idx;
+  const [c1, r1] = borderPath[idx];
+  const [c2, r2] = borderPath[(idx + 1) % blen];
+  return {
+    x: c1 + (c2 - c1) * frac,
+    y: r1 + (r2 - r1) * frac,
+  };
+}
+
+// ─── QIX ──────────────────────────────────────────────────────────────────────
+let qixList = [];
+
+function initQix(count, speedScale) {
+  qixList = [];
+  for (let i = 0; i < count; i++) {
+    const speed = (2.5 + speedScale * 1.1) * (0.8 + Math.random() * 0.4);
+    const angle = Math.random() * Math.PI * 2;
+    // Spawn near the centre, with slight scatter so two Qix don't overlap
+    const ox = (i - (count - 1) / 2) * 8;
+    qixList.push({
+      x:         COLS / 2 + ox,
+      y:         ROWS / 2,
+      dx:        Math.cos(angle) * speed,
+      dy:        Math.sin(angle) * speed,
+      speed:     speed,
+      turnTimer: 1.5 + Math.random() * 2.5,
+      armAngle:  Math.random() * Math.PI * 2,
+      armRate:   (Math.random() < 0.5 ? 1 : -1) * (1.5 + Math.random() * 2),
+    });
+  }
+}
+
+// ─── CAPTURE LOGIC ────────────────────────────────────────────────────────────
+function captureArea() {
+  // 1. Promote trail cells to BORDER
+  for (const [tc, tr] of player.trail) setCell(tc, tr, BORDER);
+
+  // 2. Find a FREE seed near each Qix (in case Qix sits on a non-FREE cell)
+  const seeds = [];
+  for (const q of qixList) {
+    let qc = Math.max(1, Math.min(COLS - 2, Math.round(q.x)));
+    let qr = Math.max(1, Math.min(ROWS - 2, Math.round(q.y)));
+    if (getCell(qc, qr) !== FREE) {
+      let found = false;
+      outer:
+      for (let rad = 1; rad <= 6; rad++) {
+        // Iterate only the perimeter cells of this radius square
+        for (let dc = -rad; dc <= rad; dc++) {
+          // Top and bottom rows of this radius
+          if (getCell(qc + dc, qr - rad) === FREE) { qc += dc; qr -= rad; found = true; break outer; }
+          if (getCell(qc + dc, qr + rad) === FREE) { qc += dc; qr += rad; found = true; break outer; }
+        }
+        for (let dr = -rad + 1; dr <= rad - 1; dr++) {
+          // Left and right columns (excluding already-checked corners)
+          if (getCell(qc - rad, qr + dr) === FREE) { qc -= rad; qr += dr; found = true; break outer; }
+          if (getCell(qc + rad, qr + dr) === FREE) { qc += rad; qr += dr; found = true; break outer; }
+        }
+      }
+      if (!found) continue;
+    }
+    seeds.push([qc, qr]);
+  }
+
+  // 3. BFS from all Qix seeds through FREE cells only
+  const visited = new Uint8Array(COLS * ROWS);
+  const queue   = [];
+  for (const [sc, sr] of seeds) {
+    if (!visited[sr * COLS + sc]) {
+      visited[sr * COLS + sc] = 1;
+      queue.push([sc, sr]);
+    }
+  }
+  for (let qi = 0; qi < queue.length; qi++) {
+    const [c, r] = queue[qi];
+    for (const [nc, nr] of [[c-1,r],[c+1,r],[c,r-1],[c,r+1]]) {
+      if (nc > 0 && nc < COLS-1 && nr > 0 && nr < ROWS-1 &&
+          !visited[nr * COLS + nc] && getCell(nc, nr) === FREE) {
+        visited[nr * COLS + nc] = 1;
+        queue.push([nc, nr]);
+      }
+    }
+  }
+
+  // 4. Mark every FREE cell NOT reachable from Qix as CAPTURED
+  let gained = 0;
+  for (let r = 1; r < ROWS-1; r++) {
+    for (let c = 1; c < COLS-1; c++) {
+      if (getCell(c, r) === FREE && !visited[r * COLS + c]) {
+        setCell(c, r, CAPTURED);
+        gained++;
+      }
+    }
+  }
+
+  // 5. Award score proportional to area gained
+  score += gained * 10;
+  return gained;
+}
+
+function capturePercent() {
+  return countCaptured() / TOTAL_INNER;
+}
+
+// ─── PLAYER UPDATE ────────────────────────────────────────────────────────────
+function updatePlayer(dt) {
+  if (player.invTimer > 0) player.invTimer -= dt;
+
+  const desired = getInputDir();
+
+  // Still animating to the next cell — just advance progress
+  if (player.progress < 1.0) {
+    player.progress += PLAYER_SPEED * dt;
+    if (player.progress < 1.0) return;
+    player.progress = 1.0;
+    onPlayerArrive();
+    if (gameState !== 'playing') return;
+  }
+
+  // ── Decide next cell to move into ──
+  // 1. Prefer the currently pressed key direction
+  // 2. Fall back to continuing in the same direction (so releasing a key stops movement)
+  // 3. Stop if neither is valid
+  if (desired) {
+    if (!tryMove(desired)) {
+      // Desired is blocked — try continuing current direction as a grace move
+      if (player.dir && player.dir !== desired) tryMove(player.dir);
+      else player.dir = null;
+    }
+  } else {
+    // No key held: stop cleanly at next cell boundary
+    player.dir = null;
+  }
+}
+
+function canMoveTo(v) {
+  if (v < 0) return false;                         // out-of-bounds
+  if (player.state === 'EDGE') {
+    return v === BORDER || v === CAPTURED || v === FREE;  // FREE starts DRAW mode
+  }
+  // DRAW mode: can traverse FREE or close onto BORDER/CAPTURED; cannot re-enter own TRAIL
+  return v === FREE || v === BORDER || v === CAPTURED;
+}
+
+function tryMove(dir) {
+  const nc = player.c + DC[dir];
+  const nr = player.r + DR[dir];
+  const nv = getCell(nc, nr);
+  if (!canMoveTo(nv)) return false;
+
+  // Start the interpolated move
+  player.pc       = player.c;
+  player.pr       = player.r;
+  player.c        = nc;
+  player.r        = nr;
+  player.progress = 0.0;
+  player.dir      = dir;
+
+  // Handle entering the new cell (mark trail, switch mode)
+  onPlayerEnterCell(nc, nr, nv);
+  return true;
+}
+
+function onPlayerEnterCell(c, r, v) {
+  if (player.state === 'EDGE' && v === FREE) {
+    // Leaving the boundary: enter draw mode
+    player.state = 'DRAW';
+    setCell(c, r, TRAIL);
+    player.trail.push([c, r]);
+  } else if (player.state === 'DRAW' && v === FREE) {
+    setCell(c, r, TRAIL);
+    player.trail.push([c, r]);
+  }
+  // Arriving at BORDER/CAPTURED while drawing is handled in onPlayerArrive
+}
+
+function onPlayerArrive() {
+  const v = getCell(player.c, player.r);
+  if (player.state === 'DRAW' && (v === BORDER || v === CAPTURED) && player.trail.length > 0) {
+    captureArea();
+    player.state = 'EDGE';
+    player.trail = [];
+    if (capturePercent() >= captureThreshold) {
+      score += lives * 500 + level * 200;
+      gameState  = 'levelclear';
+      stateTimer = 3.5;
+    }
+  }
+}
+
+function killPlayer(reason) {
+  // Restore trail cells to free space
+  for (const [tc, tr] of player.trail) setCell(tc, tr, FREE);
+  player.trail = [];
+  player.state = 'EDGE';
+
+  lives--;
+  if (lives <= 0) {
+    gameState  = 'gameover';
+    stateTimer = 0;
+  } else {
+    gameState  = 'dead';
+    stateTimer = 1.8;
+    initPlayer();
+    player.invTimer = 3.0;
+  }
+}
+
+// ─── QIX UPDATE ───────────────────────────────────────────────────────────────
+function updateQix(dt) {
+  for (const q of qixList) {
+    // Periodically change direction to give erratic movement
+    q.turnTimer -= dt;
+    if (q.turnTimer <= 0) {
+      const angle  = Math.random() * Math.PI * 2;
+      q.dx         = Math.cos(angle) * q.speed;
+      q.dy         = Math.sin(angle) * q.speed;
+      q.turnTimer  = 1.5 + Math.random() * 2.5;
+    }
+
+    // Attempt move
+    let nx = q.x + q.dx * dt;
+    let ny = q.y + q.dy * dt;
+
+    const nc = Math.floor(nx);
+    const nr = Math.floor(ny);
+    const cc = Math.floor(q.x);
+    const cr = Math.floor(q.y);
+
+    if (getCell(nc, nr) !== FREE) {
+      // Axis-split bounce
+      if (getCell(nc, cr) !== FREE) q.dx = -q.dx;
+      if (getCell(cc, nr) !== FREE) q.dy = -q.dy;
+      nx = q.x + q.dx * dt;
+      ny = q.y + q.dy * dt;
+    }
+
+    // Hard clamp to keep Qix inside the inner playfield
+    nx = Math.max(1.01, Math.min(COLS - 2.01, nx));
+    ny = Math.max(1.01, Math.min(ROWS - 2.01, ny));
+
+    // If still not in a free cell after clamping, stay put and reverse
+    if (getCell(Math.floor(nx), Math.floor(ny)) !== FREE) {
+      q.dx = -q.dx; q.dy = -q.dy;
+      nx = q.x; ny = q.y;
+    }
+
+    q.x = nx;
+    q.y = ny;
+    q.armAngle += q.armRate * dt;
+
+    if (player.invTimer > 0) continue;
+
+    // Collision: Qix enters a TRAIL cell
+    if (getCell(Math.floor(q.x), Math.floor(q.y)) === TRAIL) {
+      killPlayer('qix-trail');
+      return;
+    }
+
+    // Collision: Qix body near player while player is drawing
+    if (player.state === 'DRAW') {
+      const pp   = playerPos();
+      const dist = Math.hypot(q.x - pp.x, q.y - pp.y);
+      if (dist < 0.85) {
+        killPlayer('qix-contact');
+        return;
+      }
+    }
+  }
+}
+
+// ─── SPARX UPDATE ─────────────────────────────────────────────────────────────
+function updateSparx(dt) {
+  const blen = borderPath.length;
+  for (const sp of sparxList) {
+    sp.pos += sp.dir * sp.speed * dt;
+    sp.pos  = ((sp.pos % blen) + blen) % blen;
+
+    if (player.invTimer > 0) continue;
+
+    const sc   = sparxPos(sp);
+    const pp   = playerPos();
+    const dist = Math.hypot(sc.x - pp.x, sc.y - pp.y);
+    if (dist < 0.8) {
+      killPlayer('sparx');
+      return;
+    }
+  }
+}
+
+// ─── INPUT ────────────────────────────────────────────────────────────────────
+const keys = {};
+document.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  const managed = ['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',
+                   'KeyW','KeyA','KeyS','KeyD','Space','Enter'];
+  if (managed.includes(e.code)) e.preventDefault();
+});
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+
+function getInputDir() {
+  if (keys['ArrowLeft']  || keys['KeyA']) return 'l';
+  if (keys['ArrowRight'] || keys['KeyD']) return 'r';
+  if (keys['ArrowUp']    || keys['KeyW']) return 'u';
+  if (keys['ArrowDown']  || keys['KeyS']) return 'd';
+  return null;
+}
+
+// ─── GAME INIT ────────────────────────────────────────────────────────────────
+function initGame() {
+  level = 1;
+  lives = 3;
+  score = 0;
+  startLevel();
+}
+
+function startLevel() {
+  // Capture threshold increases slightly each level (75%–80%)
+  captureThreshold = Math.min(0.75 + (level - 1) * 0.01, 0.80);
+  initGrid();
+  initPlayer();
+  buildBorderPath();
+  const qixCount   = level >= 4 ? 2 : 1;
+  const sparxCount = Math.min(1 + Math.floor((level - 1) / 2), 4);
+  initQix(qixCount, level);
+  initSparx(sparxCount, level);
+  gameState = 'playing';
+}
+
+// ─── RENDERING ────────────────────────────────────────────────────────────────
+function render() {
+  // ── Background ──
+  ctx.fillStyle = '#00091a';
+  ctx.fillRect(0, 0, CW, CH);
+
+  // ── Grid cells ──
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const v  = getCell(c, r);
+      const px = GX + c * CELL;
+      const py = GY + r * CELL;
+      let color;
+      switch (v) {
+        case FREE:     color = '#0d1b2a'; break;
+        case BORDER:   color = '#455a64'; break;
+        case TRAIL:    color = '#f9a825'; break;
+        case CAPTURED: color = '#1565c0'; break;
+      }
+      ctx.fillStyle = color;
+      ctx.fillRect(px, py, CELL, CELL);
+    }
+  }
+
+  // ── Playfield border outline ──
+  ctx.strokeStyle = '#607d8b';
+  ctx.lineWidth   = 2;
+  ctx.strokeRect(GX + 0.5, GY + 0.5, COLS * CELL - 1, ROWS * CELL - 1);
+
+  // ── Trail glow ──
+  if (player.trail.length > 0) {
+    ctx.fillStyle = 'rgba(249,168,37,0.18)';
+    for (const [tc, tr] of player.trail) {
+      ctx.fillRect(GX + tc * CELL - 2, GY + tr * CELL - 2, CELL + 4, CELL + 4);
+    }
+  }
+
+  // ── Qix ──
+  for (const q of qixList) drawQix(q);
+
+  // ── Sparx ──
+  for (const sp of sparxList) drawSparx(sp);
+
+  // ── Player ──
+  drawPlayer();
+
+  // ── HUD ──
+  drawHUD();
+
+  // ── State overlays ──
+  if      (gameState === 'intro')      drawIntro();
+  else if (gameState === 'levelclear') drawLevelClear();
+  else if (gameState === 'gameover')   drawGameOver();
+  else if (gameState === 'dead')       drawDead();
+}
+
+// ── Player ──
+function drawPlayer() {
+  const pp = playerPos();
+  const px = GX + pp.x * CELL + CELL / 2;
+  const py = GY + pp.y * CELL + CELL / 2;
+
+  // Blink during invincibility
+  if (player.invTimer > 0 && Math.floor(Date.now() / 100) % 2 === 0) return;
+
+  ctx.save();
+  ctx.translate(px, py);
+
+  if (player.state === 'DRAW') {
+    // Pulsing outer ring while drawing
+    ctx.strokeStyle = 'rgba(249,168,37,0.55)';
+    ctx.lineWidth   = 2;
+    ctx.beginPath();
+    ctx.arc(0, 0, CELL - 1, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  ctx.shadowColor = '#00ff88';
+  ctx.shadowBlur  = 10;
+  ctx.fillStyle   = '#00ff88';
+  ctx.beginPath();
+  ctx.arc(0, 0, CELL / 2 - 1, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.strokeStyle = '#b2dfdb';
+  ctx.lineWidth   = 1.2;
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+// ── Qix ──
+function drawQix(q) {
+  const px = GX + q.x * CELL;
+  const py = GY + q.y * CELL;
+
+  ctx.save();
+  ctx.translate(px, py);
+
+  const numArms = 4;
+  const armLen  = 13;
+  for (let i = 0; i < numArms; i++) {
+    const angle = q.armAngle + (i / numArms) * Math.PI * 2;
+    const ax    = Math.cos(angle) * armLen;
+    const ay    = Math.sin(angle) * armLen;
+    const hue   = Math.round((i / numArms) * 60); // red–orange range
+
+    ctx.strokeStyle = `hsl(${hue}, 90%, 60%)`;
+    ctx.lineWidth   = 2.5;
+    ctx.shadowColor = '#ff3333';
+    ctx.shadowBlur  = 12;
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(ax, ay);
+    ctx.stroke();
+
+    // Crossbar at arm midpoint
+    const mx  = ax / 2, my  = ay / 2;
+    const px2 = -ay / 3, py2 = ax / 3;
+    ctx.lineWidth   = 1.5;
+    ctx.shadowBlur  = 6;
+    ctx.beginPath();
+    ctx.moveTo(mx + px2, my + py2);
+    ctx.lineTo(mx - px2, my - py2);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+// ── Sparx ──
+function drawSparx(sp) {
+  const sc = sparxPos(sp);
+  const px = GX + sc.x * CELL + CELL / 2;
+  const py = GY + sc.y * CELL + CELL / 2;
+  const r  = CELL / 2;
+
+  ctx.save();
+  ctx.translate(px, py);
+  ctx.shadowColor = '#ff9900';
+  ctx.shadowBlur  = 10;
+
+  // Diamond shape
+  ctx.fillStyle   = '#ff9900';
+  ctx.beginPath();
+  ctx.moveTo(0, -r);
+  ctx.lineTo(r, 0);
+  ctx.lineTo(0,  r);
+  ctx.lineTo(-r, 0);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.strokeStyle = '#ffe082';
+  ctx.lineWidth   = 1.2;
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+// ── HUD ──
+function drawHUD() {
+  ctx.fillStyle = '#001122';
+  ctx.fillRect(0, 0, CW, GY - 2);
+
+  // Title
+  ctx.fillStyle = '#4fc3f7';
+  ctx.font      = 'bold 18px "Courier New"';
+  ctx.fillText('ZOLYX', GX, 24);
+
+  // Score
+  ctx.fillStyle = '#ffffff';
+  ctx.font      = '15px "Courier New"';
+  ctx.fillText(`SCORE: ${String(score).padStart(7, '0')}`, GX + 78, 24);
+
+  // Level
+  ctx.fillStyle = '#ffd54f';
+  ctx.fillText(`LVL: ${level}`, GX + 270, 24);
+
+  // Lives (small circles)
+  ctx.fillStyle = '#90a4ae';
+  ctx.font      = '12px "Courier New"';
+  ctx.fillText('LIVES:', GX + 360, 24);
+  for (let i = 0; i < lives; i++) {
+    ctx.fillStyle   = '#00ff88';
+    ctx.shadowColor = '#00ff88';
+    ctx.shadowBlur  = 6;
+    ctx.beginPath();
+    ctx.arc(GX + 418 + i * 22, 19, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+
+  // Capture progress bar
+  const pct  = capturePercent();
+  const bx   = GX + 520;
+  const by   = 8;
+  const bw   = 220;
+  const bh   = 14;
+
+  // Background
+  ctx.fillStyle = '#0d1b2a';
+  ctx.fillRect(bx, by, bw, bh);
+
+  // Fill
+  ctx.fillStyle = pct >= captureThreshold ? '#2e7d32' : '#1565c0';
+  ctx.fillRect(bx, by, Math.floor(bw * pct), bh);
+
+  // Threshold marker
+  const tx = bx + Math.floor(bw * captureThreshold);
+  ctx.strokeStyle = '#ffee00';
+  ctx.lineWidth   = 2;
+  ctx.beginPath();
+  ctx.moveTo(tx, by - 2);
+  ctx.lineTo(tx, by + bh + 2);
+  ctx.stroke();
+
+  // Labels
+  ctx.fillStyle = '#ffffff';
+  ctx.font      = '11px "Courier New"';
+  ctx.fillText(`${Math.floor(pct * 100)}%`, bx + bw + 4, by + bh);
+  ctx.fillStyle = '#ffee00';
+  ctx.fillText(`${Math.floor(captureThreshold * 100)}%`, tx - 12, by - 3);
+
+  // Separator line
+  ctx.strokeStyle = '#1c3a50';
+  ctx.lineWidth   = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, GY - 2);
+  ctx.lineTo(CW, GY - 2);
+  ctx.stroke();
+}
+
+// ── Overlays ──
+function centeredText(text, y, font, color, shadow) {
+  ctx.save();
+  ctx.font      = font;
+  ctx.fillStyle = color;
+  ctx.textAlign = 'center';
+  if (shadow) { ctx.shadowColor = shadow; ctx.shadowBlur = 20; }
+  ctx.fillText(text, CW / 2, y);
+  ctx.restore();
+}
+
+function drawDimOverlay(alpha) {
+  ctx.fillStyle = `rgba(0,5,20,${alpha})`;
+  ctx.fillRect(0, 0, CW, CH);
+}
+
+function drawIntro() {
+  drawDimOverlay(0.7);
+  centeredText('ZOLYX', CH / 2 - 70, 'bold 64px "Courier New"', '#4fc3f7', '#4fc3f7');
+  centeredText('Capture territory — avoid the Qix!', CH / 2 - 10,
+               '18px "Courier New"', '#b0bec5', null);
+  centeredText('Arrow keys / WASD to move', CH / 2 + 28,
+               '15px "Courier New"', '#78909c', null);
+  centeredText('Move off the border to draw a line', CH / 2 + 52,
+               '15px "Courier New"', '#78909c', null);
+  centeredText('Return to border to capture area', CH / 2 + 76,
+               '15px "Courier New"', '#78909c', null);
+  centeredText('Press any arrow key to start', CH / 2 + 115,
+               '17px "Courier New"', '#ffd54f', '#ffd54f');
+}
+
+function drawDead() {
+  centeredText('✕', CH / 2 - 10, 'bold 48px "Courier New"', '#ef5350', '#ef5350');
+  centeredText(`${lives} ${lives === 1 ? 'life' : 'lives'} remaining`,
+               CH / 2 + 30, '18px "Courier New"', '#ffccbc', null);
+}
+
+function drawLevelClear() {
+  drawDimOverlay(0.72);
+  centeredText('LEVEL CLEAR!', CH / 2 - 40,
+               'bold 52px "Courier New"', '#00e676', '#00e676');
+  centeredText(`Area captured: ${Math.floor(capturePercent() * 100)}%`,
+               CH / 2 + 16, '20px "Courier New"', '#ffffff', null);
+  centeredText(`Score: ${score}`, CH / 2 + 46,
+               '20px "Courier New"', '#ffd54f', null);
+}
+
+function drawGameOver() {
+  drawDimOverlay(0.82);
+  centeredText('GAME OVER', CH / 2 - 50,
+               'bold 52px "Courier New"', '#ef5350', '#ef5350');
+  centeredText(`Final Score: ${score}`,
+               CH / 2 + 8, '22px "Courier New"', '#ffffff', null);
+  centeredText(`Level Reached: ${level}`,
+               CH / 2 + 40, '18px "Courier New"', '#b0bec5', null);
+  centeredText('Press ENTER or SPACE to play again',
+               CH / 2 + 82, '17px "Courier New"', '#ffd54f', '#ffd54f');
+}
+
+// ─── MAIN LOOP ────────────────────────────────────────────────────────────────
+function update(dt) {
+  switch (gameState) {
+    case 'intro':
+      // Start when a direction key is first pressed
+      if (getInputDir()) {
+        gameState = 'playing';
+      }
+      break;
+
+    case 'playing':
+      updatePlayer(dt);
+      if (gameState !== 'playing') break;
+      updateQix(dt);
+      if (gameState !== 'playing') break;
+      updateSparx(dt);
+      break;
+
+    case 'dead':
+      stateTimer -= dt;
+      if (stateTimer <= 0) gameState = 'playing';
+      break;
+
+    case 'levelclear':
+      stateTimer -= dt;
+      if (stateTimer <= 0) {
+        level++;
+        startLevel();
+      }
+      break;
+
+    case 'gameover':
+      if (keys['Enter'] || keys['Space']) initGame();
+      break;
+  }
+}
+
+let lastTime = 0;
+function loop(ts) {
+  const dt = Math.min((ts - lastTime) / 1000, 0.05); // cap delta at 50 ms
+  lastTime = ts;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+
+// ─── KICK OFF ─────────────────────────────────────────────────────────────────
+initGame();
+gameState = 'intro'; // show intro screen first
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>

@@ -185,14 +185,13 @@ function initQix(count, speedScale) {
     // Spawn near the centre, with slight scatter so two Qix don't overlap
     const ox = (i - (count - 1) / 2) * 8;
     qixList.push({
-      x:         COLS / 2 + ox,
-      y:         ROWS / 2,
-      dx:        Math.cos(angle) * speed,
-      dy:        Math.sin(angle) * speed,
-      speed:     speed,
-      turnTimer: 1.5 + Math.random() * 2.5,
-      armAngle:  Math.random() * Math.PI * 2,
-      armRate:   (Math.random() < 0.5 ? 1 : -1) * (1.5 + Math.random() * 2),
+      x:        COLS / 2 + ox,
+      y:        ROWS / 2,
+      dx:       Math.cos(angle) * speed,
+      dy:       Math.sin(angle) * speed,
+      speed:    speed,
+      armAngle: Math.random() * Math.PI * 2,
+      armRate:  (Math.random() < 0.5 ? 1 : -1) * (1.5 + Math.random() * 2),
     });
   }
 }
@@ -285,16 +284,19 @@ function updatePlayer(dt) {
 
   // ── Decide next cell to move into ──
   // 1. Prefer the currently pressed key direction
-  // 2. Fall back to continuing in the same direction (so releasing a key stops movement)
-  // 3. Stop if neither is valid
+  // 2. In DRAW mode, fall back to continuing in the same direction (cannot stop)
+  // 3. In EDGE mode, stop if no key is held
   if (desired) {
     if (!tryMove(desired)) {
       // Desired is blocked — try continuing current direction as a grace move
       if (player.dir && player.dir !== desired) tryMove(player.dir);
       else player.dir = null;
     }
+  } else if (player.state === 'DRAW') {
+    // Cannot stop while drawing — keep moving in the current direction
+    if (player.dir) tryMove(player.dir);
   } else {
-    // No key held: stop cleanly at next cell boundary
+    // No key held on edge: stop cleanly at next cell boundary
     player.dir = null;
   }
 }
@@ -375,15 +377,6 @@ function killPlayer(reason) {
 // ─── QIX UPDATE ───────────────────────────────────────────────────────────────
 function updateQix(dt) {
   for (const q of qixList) {
-    // Periodically change direction to give erratic movement
-    q.turnTimer -= dt;
-    if (q.turnTimer <= 0) {
-      const angle  = Math.random() * Math.PI * 2;
-      q.dx         = Math.cos(angle) * q.speed;
-      q.dy         = Math.sin(angle) * q.speed;
-      q.turnTimer  = 1.5 + Math.random() * 2.5;
-    }
-
     // Attempt move
     let nx = q.x + q.dx * dt;
     let ny = q.y + q.dy * dt;

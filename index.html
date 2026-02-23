@@ -387,9 +387,9 @@ function updateQix(dt) {
     const cr = Math.floor(q.y);
 
     if (getCell(nc, nr) !== FREE) {
-      // Axis-split bounce
-      if (getCell(nc, cr) !== FREE) q.dx = -q.dx;
-      if (getCell(cc, nr) !== FREE) q.dy = -q.dy;
+      // Bounce straight back the way it came
+      q.dx = -q.dx;
+      q.dy = -q.dy;
       nx = q.x + q.dx * dt;
       ny = q.y + q.dy * dt;
     }
